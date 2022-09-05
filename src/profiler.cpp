@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
+#include <unordered_set>
+#include <sstream>
 #include "profiler.h"
 #include "perfEvents.h"
 #include "allocTracer.h"
@@ -314,10 +316,53 @@ int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int event_
     return convertNativeTrace(native_frames, callchain, frames);
 }
 
+using AddrT = uintptr_t;
+using FuncNameT = std::string;
+using FuncSizeT = size_t;
+
+static std::map<AddrT, std::pair<FuncNameT, FuncSizeT>> lldump;
+static bool parsed{false};
+static std::string fname = []() {
+    char buf[128];
+    // FIXME: Does not handle multiple dumps in a single process
+    snprintf(buf, 128, "/tmp/%d.lldump", getpid());
+    printf("will look for dump in %s\n", buf);
+    return std::string(buf);
+}();
+#include "sys/stat.h"
+void parselldump() {
+    if (parsed)
+        return;
+
+    struct stat s2{};
+    // FIXME: ugly hack to detect whether the file is readable
+    //  Should listen for changes to the dump file and only parse it once.
+    if (stat(fname.c_str(), &s2)) {
+        return;
+    }
+
+    std::ifstream f{fname};
+    if (f.fail()) {
+        return;
+    }
+    for (std::string line; std::getline(f, line); ) {
+        std::cout << "reading from " << fname << std::endl;
+        std::stringstream s{line};
+        std::string name;
+        uint64_t size, addr;
+        s >> name >> size >> addr;
+        lldump[addr] = {name, size};
+        Log::debug("parsed %s %ld %ld", name.c_str(), size, addr);
+        parsed = true;
+    }
+}
+
 int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGCT_CallFrame* frames) {
     int depth = 0;
     jmethodID prev_method = NULL;
 
+    // FIXME: This should not be called every single time in convertNativeTrace.
+    parselldump();
     for (int i = 0; i < native_frames; i++) {
         const char* current_method_name = findNativeMethod(callchain[i]);
         if (current_method_name != NULL && NativeFunc::isMarked(current_method_name)) {
@@ -327,6 +372,26 @@ int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGC
         }
 
         jmethodID current_method = (jmethodID)current_method_name;
+
+        if (current_method_name == nullptr) {
+            auto pc = (AddrT) callchain[i];
+            auto pos = lldump.upper_bound(pc);
+            if (pos == lldump.begin()) {
+                // address is outside the lldump range
+                // FIXME: This is probably an off-by-one error in some boundary cases.
+                //  should also check lldump.end()
+                Log::trace("not found");
+            } else {
+                auto func = std::prev(pos);
+                auto start = func->first;
+                auto size = func->second.second;
+                if (pc >= start && pc < (start + size)) {
+                    Log::trace("Found %s", func->second.first.c_str());
+                    current_method = (jmethodID) func->second.first.c_str();
+                }
+            }
+        }
+
         if (current_method == prev_method && _cstack == CSTACK_LBR) {
             // Skip duplicates in LBR stack, where branch_stack[N].from == branch_stack[N+1].to
             prev_method = NULL;
