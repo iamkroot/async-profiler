@@ -316,7 +316,7 @@ int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int event_
     return convertNativeTrace(native_frames, callchain, frames);
 }
 
-using AddrT = uintptr_t;
+using AddrT = intptr_t;
 using FuncNameT = std::string;
 using FuncSizeT = size_t;
 
@@ -357,12 +357,41 @@ void parselldump() {
     }
 }
 
+#include <inotify-cpp/NotifierBuilder.h>
+#include <filesystem>
+
+void Profiler::lldump_listener() {
+    std::filesystem::path dir{"/tmp/.lldump/"};
+    std::filesystem::create_directories(dir);
+    Log::info("starting lldump listener");
+    auto handleNotif = [](inotify::Notification notif) {
+        switch (notif.event) {
+            case inotify::Event::create:
+            default:{
+                Log::info("notif! %s %d", notif.path.c_str(), notif.event);
+            }
+        }
+    };
+    auto events = {inotify::Event::create | inotify::Event::is_dir, inotify::Event::access, inotify::Event::close};
+    auto notifier = inotify::BuildNotifier().watchPathRecursively(dir).onEvents(events, handleNotif);
+    notifier.run();
+    Log::info("ending lldump listener");
+
+    // notifier.run();    // pthread_t t;
+    // pthread_create(&t, nullptr, &func, nullptr);
+    // std::thread thread{[&](){notifier.run()}};
+}
+
 int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGCT_CallFrame* frames) {
     int depth = 0;
     jmethodID prev_method = NULL;
 
     // FIXME: This should not be called every single time in convertNativeTrace.
-    parselldump();
+    // parselldump();
+
+
+    auto acc = this->_lldump_funcptrs.create();
+
     for (int i = 0; i < native_frames; i++) {
         const char* current_method_name = findNativeMethod(callchain[i]);
         if (current_method_name != NULL && NativeFunc::isMarked(current_method_name)) {
@@ -375,21 +404,37 @@ int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGC
 
         if (current_method_name == nullptr) {
             auto pc = (AddrT) callchain[i];
-            auto pos = lldump.upper_bound(pc);
-            if (pos == lldump.begin()) {
-                // address is outside the lldump range
-                // FIXME: This is probably an off-by-one error in some boundary cases.
-                //  should also check lldump.end()
-                Log::trace("not found");
-            } else {
-                auto func = std::prev(pos);
-                auto start = func->first;
-                auto size = func->second.second;
-                if (pc >= start && pc < (start + size)) {
-                    Log::trace("Found %s", func->second.first.c_str());
-                    current_method = (jmethodID) func->second.first.c_str();
+            auto pos = acc.lower_bound(-pc);
+            if (pos.good()) {
+                auto start = -(*pos);
+                auto func = _lldumpmap.find(start);
+                if (func != _lldumpmap.end()) {
+                    auto size = func->second.second;
+                    if (pc >= start && pc < (start + size)) {
+                        Log::trace("Found %s", func->second.first.c_str());
+                        current_method = (jmethodID) func->second.first.c_str();
+                    }
+                } else {
+                    Log::error("Func present in skiplist, but not in dumpmap: %lu\n", start);
                 }
+            } else {
+                Log::trace("Not found! %ld\n", pc);
             }
+            // auto pos = lldump.upper_bound(pc);
+            // if (pos == lldump.begin()) {
+            //     // address is outside the lldump range
+            //     // FIXME: This is probably an off-by-one error in some boundary cases.
+            //     //  should also check lldump.end()
+            //     Log::trace("not found");
+            // } else {
+            //     auto func = std::prev(pos);
+            //     auto start = func->first;
+            //     auto size = func->second.second;
+            //     if (pc >= start && pc < (start + size)) {
+            //         Log::trace("Found %s", func->second.first.c_str());
+            //         current_method = (jmethodID) func->second.first.c_str();
+            //     }
+            // }
         }
 
         if (current_method == prev_method && _cstack == CSTACK_LBR) {
@@ -970,6 +1015,7 @@ Error Profiler::checkJvmCapabilities() {
     return Error::OK;
 }
 
+
 Error Profiler::start(Arguments& args, bool reset) {
     MutexLocker ml(_state_lock);
     if (_state > IDLE) {
@@ -1067,6 +1113,11 @@ Error Profiler::start(Arguments& args, bool reset) {
             return error;
         }
     }
+
+    if (pthread_create(&_lldump_thread, NULL, lldumpThreadEntry, this) != 0) {
+        return Error("Unable to create lldump parser thread");
+    }
+
 
     error = _engine->start(args);
     if (error) {
