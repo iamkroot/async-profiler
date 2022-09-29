@@ -22,6 +22,7 @@
 #include <time.h>
 #include <folly/ConcurrentSkipList.h>
 #include <folly/AtomicHashMap.h>
+#include <filesystem>
 #include "arch.h"
 #include "arguments.h"
 #include "callTraceStorage.h"
@@ -36,6 +37,7 @@
 #include "threadFilter.h"
 #include "trap.h"
 #include "vmEntry.h"
+#include <inotify-cpp/NotifierBuilder.h>
 
 
 const char FULL_VERSION_STRING[] =
@@ -109,18 +111,20 @@ class Profiler {
     const void* _call_stub_begin;
     const void* _call_stub_end;
     pthread_t _lldump_thread;
+    // inotify::NotifierBuilder notifier;
     static void* lldumpThreadEntry(void* profiler) {
-        ((Profiler*)profiler)->lldump_listener();
+        Profiler::lldump_listener();
         return nullptr;
     }
 using AddrT = intptr_t;
 using FuncNameT = std::string;
 using FuncSizeT = size_t;
 using MValT = std::pair<FuncNameT, FuncSizeT>;
-    folly::AtomicHashMap<AddrT, MValT> _lldumpmap;
+    static folly::AtomicHashMap<AddrT, MValT> _lldumpmap;
 
-    folly::ConcurrentSkipList<AddrT> _lldump_funcptrs;
-    void lldump_listener();
+    static folly::ConcurrentSkipList<AddrT> _lldump_funcptrs;
+    static void lldump_listener();
+    static void parse_lldumpFile(std::filesystem::path filePath);
 
     // dlopen() hook support
     void** _dlopen_entry;
@@ -190,8 +194,6 @@ using MValT = std::pair<FuncNameT, FuncSizeT>;
         _native_libs(),
         _call_stub_begin(NULL),
         _call_stub_end(NULL),
-        _lldumpmap(500),
-        _lldump_funcptrs(4),
         _dlopen_entry(NULL) {
 
         for (int i = 0; i < CONCURRENCY_LEVEL; i++) {

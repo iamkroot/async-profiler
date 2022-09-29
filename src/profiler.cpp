@@ -319,67 +319,54 @@ int Profiler::getNativeTrace(void* ucontext, ASGCT_CallFrame* frames, int event_
 using AddrT = intptr_t;
 using FuncNameT = std::string;
 using FuncSizeT = size_t;
+using NativeFuncInfoValT = std::pair<FuncNameT, FuncSizeT>;
+using NativeAddrSetT = folly::ConcurrentSkipList<AddrT>;
+using NativeFuncInfoT = folly::AtomicHashMap<AddrT, NativeFuncInfoValT>;
+NativeFuncInfoT Profiler::_lldumpmap{64};
+NativeAddrSetT Profiler::_lldump_funcptrs{4};
 
-static std::map<AddrT, std::pair<FuncNameT, FuncSizeT>> lldump;
-static bool parsed{false};
-static std::string fname = []() {
-    char buf[128];
-    // FIXME: Does not handle multiple dumps in a single process
-    snprintf(buf, 128, "/tmp/%d.lldump", getpid());
-    printf("will look for dump in %s\n", buf);
-    return std::string(buf);
-}();
-#include "sys/stat.h"
-void parselldump() {
-    if (parsed)
-        return;
+void Profiler::parse_lldumpFile(std::filesystem::path filePath) {
+    Log::trace("Reading from lldump file: %s\n", filePath.c_str());
+    std::ifstream f{filePath};
+    std::string name;
+    uint64_t size;
+    intptr_t addr;
+    auto acc = NativeAddrSetT::Accessor{&_lldump_funcptrs};
 
-    struct stat s2{};
-    // FIXME: ugly hack to detect whether the file is readable
-    //  Should listen for changes to the dump file and only parse it once.
-    if (stat(fname.c_str(), &s2)) {
-        return;
+    while (!f.eof()) {
+        f >> name >> size >> addr;
+        if (name.empty() || f.eof())
+            break;
+        Log::trace("parsed %s %ld %p", name.c_str(), size, (void*) addr);
+        _lldumpmap.insert(addr, {std::move(name), size});
+        acc.insert(-addr);
     }
-
-    std::ifstream f{fname};
-    if (f.fail()) {
-        return;
-    }
-    for (std::string line; std::getline(f, line); ) {
-        std::cout << "reading from " << fname << std::endl;
-        std::stringstream s{line};
-        std::string name;
-        uint64_t size, addr;
-        s >> name >> size >> addr;
-        lldump[addr] = {name, size};
-        Log::debug("parsed %s %ld %ld", name.c_str(), size, addr);
-        parsed = true;
-    }
+    // Log::trace("Num entsrs %ld", acc.size());
+    // for (auto &elem: acc) {
+    //     Log::debug("el %ld", elem);
+    // }
 }
-
-#include <inotify-cpp/NotifierBuilder.h>
-#include <filesystem>
 
 void Profiler::lldump_listener() {
     std::filesystem::path dir{"/tmp/.lldump/"};
     std::filesystem::create_directories(dir);
     Log::info("starting lldump listener");
-    auto handleNotif = [](inotify::Notification notif) {
+    auto handleNotif = [&](inotify::Notification notif) {
         switch (notif.event) {
-            case inotify::Event::create:
+            case inotify::Event::close_write: {
+                if (notif.path.extension() == ".lldump") {
+                    parse_lldumpFile(notif.path);
+                }
+            }
             default:{
-                Log::info("notif! %s %d", notif.path.c_str(), notif.event);
+                Log::info("notif! %s", notif.path.c_str());
             }
         }
     };
-    auto events = {inotify::Event::create | inotify::Event::is_dir, inotify::Event::access, inotify::Event::close};
-    auto notifier = inotify::BuildNotifier().watchPathRecursively(dir).onEvents(events, handleNotif);
+    // auto events = {inotify::Event::create | inotify::Event::is_dir, inotify::Event::access, inotify::Event::close, inotify::Event::all};
+    auto notifier = inotify::BuildNotifier().watchPathRecursively(dir).onEvent(inotify::Event::close_write, handleNotif);
     notifier.run();
     Log::info("ending lldump listener");
-
-    // notifier.run();    // pthread_t t;
-    // pthread_create(&t, nullptr, &func, nullptr);
-    // std::thread thread{[&](){notifier.run()}};
 }
 
 int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGCT_CallFrame* frames) {
@@ -390,7 +377,7 @@ int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGC
     // parselldump();
 
 
-    auto acc = this->_lldump_funcptrs.create();
+    auto acc = NativeAddrSetT::Accessor{&_lldump_funcptrs};
 
     for (int i = 0; i < native_frames; i++) {
         const char* current_method_name = findNativeMethod(callchain[i]);
@@ -411,14 +398,15 @@ int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGC
                 if (func != _lldumpmap.end()) {
                     auto size = func->second.second;
                     if (pc >= start && pc < (start + size)) {
-                        Log::trace("Found %s", func->second.first.c_str());
+                        // Log::trace("Found %s", func->second.first.c_str());
                         current_method = (jmethodID) func->second.first.c_str();
                     }
                 } else {
-                    Log::error("Func present in skiplist, but not in dumpmap: %lu\n", start);
+                    Log::error("Func present in skiplist, but not in dumpmap: %lu", start);
                 }
             } else {
-                Log::trace("Not found! %ld\n", pc);
+                // Log::trace("num entries: %ld", acc.size());
+                // Log::trace("Not found! %ld", pc);
             }
             // auto pos = lldump.upper_bound(pc);
             // if (pos == lldump.begin()) {
@@ -1114,7 +1102,7 @@ Error Profiler::start(Arguments& args, bool reset) {
         }
     }
 
-    if (pthread_create(&_lldump_thread, NULL, lldumpThreadEntry, this) != 0) {
+    if (pthread_create(&_lldump_thread, NULL, lldumpThreadEntry, nullptr) != 0) {
         return Error("Unable to create lldump parser thread");
     }
 
@@ -1179,6 +1167,13 @@ Error Profiler::stop() {
 
     if (_event_mask & EM_LOCK) lock_tracer.stop();
     if (_event_mask & EM_ALLOC) _alloc_engine->stop();
+
+    Log::trace("Trying to kill profiler");
+
+    // notifier.stop();
+    pthread_kill(_lldump_thread, 0);
+    // pthread_join(_lldump_thread, nullptr);
+    // Log::trace("Killed thread");
 
     _engine->stop();
 
