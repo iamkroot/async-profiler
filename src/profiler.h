@@ -121,10 +121,13 @@ using FuncNameT = std::string;
 using FuncSizeT = size_t;
 using MValT = std::pair<FuncNameT, FuncSizeT>;
     static folly::AtomicHashMap<AddrT, MValT> _lldumpmap;
+using BtValT = std::pair<AddrT, uint32_t>;
+    static folly::AtomicHashMap<AddrT, BtValT> _lldumpBtMap;
 
     static folly::ConcurrentSkipList<AddrT> _lldump_funcptrs;
     static void lldump_listener();
     static void parse_lldumpFile(std::filesystem::path filePath);
+    static void parse_lldumpBtFile(std::filesystem::path filePath);
 
     // dlopen() hook support
     void** _dlopen_entry;

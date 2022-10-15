@@ -320,9 +320,12 @@ using AddrT = intptr_t;
 using FuncNameT = std::string;
 using FuncSizeT = size_t;
 using NativeFuncInfoValT = std::pair<FuncNameT, FuncSizeT>;
+using NativeBTInfoValT = std::pair<AddrT, uint32_t>;
 using NativeAddrSetT = folly::ConcurrentSkipList<AddrT>;
 using NativeFuncInfoT = folly::AtomicHashMap<AddrT, NativeFuncInfoValT>;
+using NativeBTInfoT = folly::AtomicHashMap<AddrT, NativeBTInfoValT>;
 NativeFuncInfoT Profiler::_lldumpmap{64};
+NativeBTInfoT Profiler::_lldumpBtMap{256};
 NativeAddrSetT Profiler::_lldump_funcptrs{4};
 
 void Profiler::parse_lldumpFile(std::filesystem::path filePath) {
@@ -360,6 +363,22 @@ void Profiler::parse_lldumpFile(std::filesystem::path filePath) {
     // }
 }
 
+void Profiler::parse_lldumpBtFile(std::filesystem::path filePath) {
+    // Log::trace("Reading from lldump file: %s\n", filePath.c_str());
+    std::ifstream f{filePath};
+    uintptr_t addr;
+    uintptr_t btAddr;
+    uint32_t numFrames;
+
+    while (!f.eof()) {
+        f >> addr >> btAddr >> numFrames;
+        if (!addr || f.eof())
+            break;
+        // Log::trace("BTparsed %p %p %u", (void*) addr, (void*) btAddr, numFrames);
+        _lldumpBtMap.insert({addr, {btAddr, numFrames}});
+    }
+}
+
 void Profiler::lldump_listener() {
     std::filesystem::path dir{"/tmp/.lldump/"};
     std::filesystem::create_directories(dir);
@@ -368,7 +387,9 @@ void Profiler::lldump_listener() {
         switch (notif.event) {
             case inotify::Event::close_write: {
                 if (notif.path.extension() == ".lldump") {
-                    parse_lldumpFile(notif.path);
+                    // parse_lldumpFile(notif.path);
+                } else if (notif.path.extension() == ".bt") {
+                    parse_lldumpBtFile(notif.path);
                 }
             }
             default:{
@@ -381,6 +402,25 @@ void Profiler::lldump_listener() {
     notifier.run();
     Log::info("ending lldump listener");
 }
+
+enum class UnknownFrameDiscoveryMethod {
+    None,
+    /**
+     * @brief Use function range info dumped by llvm.
+     *
+     * Depends on fno-omit-frame-pointer and cannot discover inlined functions.
+     */
+    LLDump,
+    /**
+     * @brief Use backtraces dumped by llvm for each PC.
+     *
+     * Uses dwarf info for discovering inlined functions, more expensive.
+     * Also depends on fno-omit-frame-pointer to do the actual unwinding.
+     */
+    LLDumpBT,
+};
+
+std::set<AddrT> nofoundAddrs;
 
 int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGCT_CallFrame* frames) {
     int depth = 0;
@@ -397,41 +437,58 @@ int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGC
         }
 
         jmethodID current_method = (jmethodID)current_method_name;
-
+        const UnknownFrameDiscoveryMethod unknownFrameDiscoveryMethod{UnknownFrameDiscoveryMethod::LLDumpBT};
         if (current_method_name == nullptr) {
-            auto pc = (AddrT) callchain[i];
-            auto pos = acc.lower_bound(-pc);
-            if (pos.good()) {
-                auto start = -(*pos);
-                auto func = _lldumpmap.find(start);
-                if (func != _lldumpmap.end()) {
-                    auto size = func->second.second;
-                    if (pc >= start && pc < (start + size)) {
-                        // Log::trace("Found %s", func->second.first.c_str());
-                        current_method = (jmethodID) func->second.first.c_str();
+            switch (unknownFrameDiscoveryMethod) {
+                case UnknownFrameDiscoveryMethod::None:
+                    break;
+                case UnknownFrameDiscoveryMethod::LLDump: {
+                    auto pc = (AddrT) callchain[i];
+                    auto pos = acc.lower_bound(-pc);
+                    if (pos.good()) {
+                        auto start = -(*pos);
+                        auto func = _lldumpmap.find(start);
+                        if (func != _lldumpmap.end()) {
+                            auto size = func->second.second;
+                            if (pc >= start && pc < (start + size)) {
+                                // Log::trace("Found %s", func->second.first.c_str());
+                                current_method = (jmethodID) func->second.first.c_str();
+                            }
+                        } else {
+                            Log::error("Func present in skiplist, but not in dumpmap: %lu", start);
+                        }
+                    } else {
+                        // Log::trace("num entries: %ld", acc.size());
+                        // Log::trace("Not found! %ld", pc);
+
                     }
-                } else {
-                    Log::error("Func present in skiplist, but not in dumpmap: %lu", start);
+                    break;
                 }
-            } else {
-                // Log::trace("num entries: %ld", acc.size());
-                // Log::trace("Not found! %ld", pc);
+                case UnknownFrameDiscoveryMethod::LLDumpBT: {
+                    auto pc = (AddrT) callchain[i];
+                    auto it = _lldumpBtMap.find(pc);
+                    if (it == _lldumpBtMap.end()) {
+                        if (nofoundAddrs.insert(pc).second)
+                            Log::trace("Not found! %p", (void*)pc);
+                        break;
+                    }
+                    auto [btAddr, numFrames] = it->second;
+                    auto bt = (uintptr_t*) btAddr;
+                    for (int j = 0; j < numFrames; ++j) {
+                        current_method = (jmethodID) bt[j];
+                        // skip the last frame, will be handled later
+                        if (j + 1 < numFrames){
+                            frames[depth].bci = BCI_NATIVE_FRAME;
+                            frames[depth].method_id = current_method;
+                            depth++;
+                        }
+
+                    }
+
+                    break;
+                }
+
             }
-            // auto pos = lldump.upper_bound(pc);
-            // if (pos == lldump.begin()) {
-            //     // address is outside the lldump range
-            //     // FIXME: This is probably an off-by-one error in some boundary cases.
-            //     //  should also check lldump.end()
-            //     Log::trace("not found");
-            // } else {
-            //     auto func = std::prev(pos);
-            //     auto start = func->first;
-            //     auto size = func->second.second;
-            //     if (pc >= start && pc < (start + size)) {
-            //         Log::trace("Found %s", func->second.first.c_str());
-            //         current_method = (jmethodID) func->second.first.c_str();
-            //     }
-            // }
         }
 
         if (current_method == prev_method && _cstack == CSTACK_LBR) {
