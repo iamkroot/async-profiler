@@ -326,12 +326,25 @@ NativeFuncInfoT Profiler::_lldumpmap{64};
 NativeAddrSetT Profiler::_lldump_funcptrs{4};
 
 void Profiler::parse_lldumpFile(std::filesystem::path filePath) {
-    Log::trace("Reading from lldump file: %s\n", filePath.c_str());
+    // Log::trace("Reading from lldump file: %s\n", filePath.c_str());
     std::ifstream f{filePath};
     std::string name;
     uint64_t size;
     intptr_t addr;
     auto acc = NativeAddrSetT::Accessor{&_lldump_funcptrs};
+
+    f >> name;
+    if (name != "NEWFILE") {
+        Log::error("Invalid start of lldump file!");
+        return;
+    }
+    uint64_t fileKey ;
+    intptr_t elfBase, elfSize;
+    f >> fileKey >> elfBase >> elfSize;
+    Log::debug("Got elf file key=%lu base=%lx size=%lu", fileKey, elfBase, elfSize);
+    // Doesn't work, the ELF is not executable, just relocatable.
+    // It doesn't have any program headers.
+    Symbols::parseJITElf(&Profiler::instance()->_native_libs, fileKey, (const char*)elfBase, elfSize);
 
     while (!f.eof()) {
         f >> name >> size >> addr;
@@ -372,10 +385,6 @@ void Profiler::lldump_listener() {
 int Profiler::convertNativeTrace(int native_frames, const void** callchain, ASGCT_CallFrame* frames) {
     int depth = 0;
     jmethodID prev_method = NULL;
-
-    // FIXME: This should not be called every single time in convertNativeTrace.
-    // parselldump();
-
 
     auto acc = NativeAddrSetT::Accessor{&_lldump_funcptrs};
 

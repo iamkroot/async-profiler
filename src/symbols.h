@@ -29,6 +29,7 @@ class Symbols {
   public:
     static void parseKernelSymbols(CodeCache* cc);
     static void parseLibraries(CodeCacheArray* array, bool kernel_symbols);
+    static void parseJITElf(CodeCacheArray* array, uint64_t objKey, const char* base, intptr_t size);
 
     static bool haveKernelSymbols() {
         return _have_kernel_symbols;

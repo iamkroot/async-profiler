@@ -188,7 +188,7 @@ class ElfParser {
   public:
     static void parseProgramHeaders(CodeCache* cc, const char* base);
     static bool parseFile(CodeCache* cc, const char* base, const char* file_name, bool use_debug);
-    static void parseMem(CodeCache* cc, const char* base);
+    static void parseMem(CodeCache* cc, const char* base, bool use_debug);
 };
 
 
@@ -242,10 +242,10 @@ bool ElfParser::parseFile(CodeCache* cc, const char* base, const char* file_name
     return true;
 }
 
-void ElfParser::parseMem(CodeCache* cc, const char* base) {
+void ElfParser::parseMem(CodeCache* cc, const char* base, bool use_debug = false) {
     ElfParser elf(cc, base, base);
     if (elf.validHeader()) {
-        elf.loadSymbols(false);
+        elf.loadSymbols(use_debug);
     }
 }
 
@@ -605,6 +605,26 @@ void Symbols::parseLibraries(CodeCacheArray* array, bool kernel_symbols) {
 
     free(str);
     fclose(f);
+}
+
+void Symbols::parseJITElf(CodeCacheArray* array, uint64_t objKey, const char* base, intptr_t size) {
+    MutexLocker ml(_parse_lock);
+
+    short count = array->count();
+    if (count >= MAX_NATIVE_LIBS) {
+        Log::warn("too many native libs");
+        return;
+    }
+    if (_parsed_inodes.insert(objKey).second) {
+        Log::info("parsing elf");
+        CodeCache* cc = new CodeCache{"tmplib", count, base, base + size};
+        ElfParser::parseProgramHeaders(cc, base);
+
+        ElfParser::parseMem(cc, base, true);
+        // DwarfParser dp{"tmplib", base, };
+        cc->sort();
+        array->add(cc);
+    }
 }
 
 #endif // __linux__
